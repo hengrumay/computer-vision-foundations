@@ -5,7 +5,7 @@
 # COMMAND ----------
 
 # MAGIC %md The purpose of this notebook is to demonstrate patterns supporting computer vision model training.  
-# MAGIC 
+# MAGIC
 # MAGIC * If you intend to deploy the model as a microservice or as part of a Spark pipeline using user-defined functions, use this **03a** notebook , which uses one of the latest versions of Databricks runtime.  
 # MAGIC * If you intend to deploy the model to an edge device, you should use the next notebook **03b** to train the model on a cluster where the Python version used by the cluster is aligned with the version deployed on your device.  (Our Raspberry Pi device runs Python 3.7, and for that reason, we have trained our edge-deployed models on the Databricks 7.3 ML cluster which runs that same version of Python.) 
 
@@ -15,7 +15,7 @@
 import sys
 
 print('You are running a Databricks {0} cluster leveraging Python {1}'.format( 
-  spark.conf.get("spark.databricks.clusterUsageTags.sparkVersion"),
+  spark.conf.get("spark.x4databricks.clusterUsageTags.sparkVersion"),
   sys.version.split(' ')[0])
   )
 
@@ -50,21 +50,21 @@ import io
 # COMMAND ----------
 
 # MAGIC %md ## Introduction
-# MAGIC 
+# MAGIC
 # MAGIC This notebook will demonstrate how we train a computer vision model at scale.  The general workflow we will follow will take data from the table we loaded with image data in our last notebook and then load it into a high-performance, scalable caching layer.  Leveraging that cache, we will then generate numerous model iterations in order to discover an optimal set of hyperparameters for our model.  Those optimized hyperparameter values will then be used to train a final model in a scalable, distributed manner for later deployment.
-# MAGIC 
+# MAGIC
 # MAGIC <img src='https://brysmiwasb.blob.core.windows.net/demos/images/cv_model_training_workflow.png' width=600>
 
 # COMMAND ----------
 
 # MAGIC %md ## Step 1: Access Data
-# MAGIC 
+# MAGIC
 # MAGIC Our image data resides in a Delta Table named *images*.  The raw binary for each image is available through a field named *content*. The relatively small size of each image along with the small overall number of images in our table would allow us to extract our data to a pandas dataframe against which we could then train our model.  However, we'd like to establish a pattern that would allow our processing to scale, and for that, we'll retrieve our data to a [Petastorm](https://docs.databricks.com/applications/machine-learning/load-data/petastorm.html) cache.
-# MAGIC 
+# MAGIC
 # MAGIC Petastorm is a technology available in the Databricks platform which allows us to retrieve data using the distributed power of the cluster and then cache it to Parquet files for fast access by Tensorflow, PyTorch and PySpark.  The caching of data in this manner allows us to train models on volumes of data that might otherwise overwhelm the memory resources available on an individual cluster node.
-# MAGIC 
+# MAGIC
 # MAGIC <img src='https://brysmiwasb.blob.core.windows.net/demos/images/cv_petastorm.png' width=500>
-# MAGIC 
+# MAGIC
 # MAGIC Our first step in building the Petastorm cache is to retrieve the image data and divide it into training and testing sets:
 
 # COMMAND ----------
@@ -98,9 +98,9 @@ display(
 # COMMAND ----------
 
 # MAGIC %md With the sets defined, we persist them with Petastorm using a Spark (to Petastorm) converter.  This should be a relatively simple task but we ran into an interesting problem when using Horovod (Step 4 in this notebook) with the Petastorm cache which we will explain here to help others who may encounter a similar issue.
-# MAGIC 
+# MAGIC
 # MAGIC Petastorm writes its output to Parquet files.  Each Parquet file consists of one or more internal row groups. Horovod expects the total number of row groups available to it to be equal to or greater than the number of shards (parallel processes) it employs.  In Step 4, we direct Horovod to leverage a single GPU per cluster worker or the toatl number of virtual CPUs across cluster workers for its shards.  We must therefore ensure Petastorm generates enough row groups to align with that number.
-# MAGIC 
+# MAGIC
 # MAGIC To do this, we consider that each row in our dataset consists of a binary image of variable size and an 4-byte integer label. We sum the bytes associated with each for each of the training and testing datasets and divide that number by the number of virtual CPUs (as presented by *sc.defaultParallelism*) to ensure we align with Horovod's requirements:
 
 # COMMAND ----------
@@ -128,7 +128,7 @@ converter_test = make_spark_converter(images_test, parquet_row_group_size_bytes=
 # COMMAND ----------
 
 # MAGIC %md With the data cached, we now need to consider how we will access it.  The instructions for reading data from the cache are captured in a Petastorm [TransformSpec](https://petastorm.readthedocs.io/en/latest/api.html#module-petastorm.transform). The spec defines how records are not only read from the cache but the transformations required before the data can be made available to the consuming model. This can include image preprocessing transformations.
-# MAGIC 
+# MAGIC
 # MAGIC Our TransformSpec will read raw images from the cache and return a resized, normalized tensor (along with image labels) as expected by the PyTorch model we will employ.  An important part of the spec definition is identifying the shape of the tensor object returned with each image. As we will be taking our 600x600 3-channel (RGB) images down to a 256x256 image size (while preserving the RGB channels), our spec is defined as follows.  Please note that that the configuration of the *Normalize* transformation is [specified](https://pytorch.org/hub/pytorch_vision_mobilenet_v2/) by the TorchVision model we'll eventually employ:
 
 # COMMAND ----------
@@ -184,10 +184,13 @@ def get_transform_spec(is_train=True):
 # COMMAND ----------
 
 # DBTITLE 1,Test TransformSpec
+## worked on RUNME -- might have to rerun 02_Data_Ingest
+
 # access petastorm cache and transform data using spec
 with converter_train.make_torch_dataloader(
       transform_spec=get_transform_spec(is_train=True), 
-      batch_size=1
+      batch_size=1,
+    #   timeout=600  # Increase the timeout to 10 minutes 
       ) as train_dataloader:
 
   # retrieve records from cache
@@ -198,11 +201,11 @@ with converter_train.make_torch_dataloader(
 # COMMAND ----------
 
 # MAGIC %md ## Step 2: Define Model
-# MAGIC 
+# MAGIC
 # MAGIC With data access defined, we will turn our attention to model training.  Our first step is simply to get our model defined and to verify it reads data from Petastorm correctly. Once we have this working, we can tackle the distribution of model training cycles.
-# MAGIC 
+# MAGIC
 # MAGIC To keep things simple, we'll leverage  the [MobileNetV2 model](https://pytorch.org/hub/pytorch_vision_mobilenet_v2/#model-description) available through TorchVision which has been pre-trained on the [ImageNet dataset](https://www.image-net.org/about.php). Our model will attempt to differentiate between two image classes, *i.e.* those that contain an object of interest and those that do not.  It will read images 32 at a time.  It will take 5 passes over the entire training dataset:
-# MAGIC 
+# MAGIC
 # MAGIC **NOTE** We are borrowing heavily from [this notebook](https://docs.databricks.com/_static/notebooks/deep-learning/petastorm-spark-converter-pytorch.html) and have attempted to preserve the codes structure to provide an easier cross-reference whenever possible. In addition, we are not diving into the topics of image classification or the use of pre-trained models for computer vision scenarios so that we may remain focused on model training mechanics.  These other topics are ones we'll tackle in future notebooks.
 
 # COMMAND ----------
@@ -403,11 +406,11 @@ loss, acc = train_and_evaluate(**{'lr':0.01, 'momentum':0.9})
 # COMMAND ----------
 
 # MAGIC %md ##Step 3: Perform Hyperparameter Tuning
-# MAGIC 
+# MAGIC
 # MAGIC Now that we've demonstrated our ability to train the model, let's focus on hyperparameter tuning.  Our model, like most models, have a number of parameters that control its behavior during training.  The setting of these parameters is challenging in that there are a wide range of potential values for each parameter and complex interactions between variables when applied against a given data set.   
-# MAGIC 
+# MAGIC
 # MAGIC <img src='https://brysmiwasb.blob.core.windows.net/demos/images/cv_hyperopt.png' width=500>
-# MAGIC 
+# MAGIC
 # MAGIC A common way of dealing with this complexity is to train a series of models using different hyperparameter values to determine which combinations produce the best results. Using [Hyperopt](https://docs.databricks.com/applications/machine-learning/automl-hyperparam-tuning/index.html#hyperparameter-tuning-with-hyperopt), we can intelligently navigate a range of hyperparameter values to efficiently arrive at an optimal configuration.  This often requires us to train hundreds or even thousands of models to discover an optimum. Leveraging the *SparkTrials* feature, we can tackle these training iterations across the resources provided by our cluster, allowing us to shorten the time for this work based on the number of resources we wish to provision:
 
 # COMMAND ----------
@@ -459,27 +462,27 @@ argmin
 # COMMAND ----------
 
 # MAGIC %md Please note in the hyperparameter run, we leveraged [mlflow](https://mlflow.org/), another technology pre-integrated with the Databricks ML runtime, to capture various metrics for our runs.  With hyperopt, tracking is automatic but by explicitly calling to mlflow, we can log additional metrics such as accuracy to help us explore hyperparameter tuning.
-# MAGIC 
+# MAGIC
 # MAGIC With access to these data, we can use the mlflow [experiment interface](https://docs.databricks.com/applications/mlflow/tracking.html) and explore how various hyperparameters impact model metrics:</p>
-# MAGIC 
+# MAGIC
 # MAGIC <img src='https://brysmiwasb.blob.core.windows.net/demos/images/cv_model_hyperparam.PNG' width=90%>
 
 # COMMAND ----------
 
 # MAGIC %md ##Step 4: Train Optimized Model
-# MAGIC 
+# MAGIC
 # MAGIC With optimal hyperparameters identified, we can now train an optimized version of our model.  While we have demonstrated we could do this on a single node, we might take advantage of [Horovod](https://docs.databricks.com/applications/machine-learning/train-model/distributed-training/horovod-runner.html) to distribute this work across the nodes in our cluster.  In a nutshell, Horovod provides a framework for partitioning the training of a Tensorflow or PyTorch model and aggregating the results to form a final, consolidated model.
-# MAGIC 
+# MAGIC
 # MAGIC <img src='https://brysmiwasb.blob.core.windows.net/demos/images/cv_horovod.png' width=500>
-# MAGIC 
+# MAGIC
 # MAGIC While conceptually simple, the use of Horovod does require we us to rewrite our core helper functions in order to distribute the work. Per the [Horovod documentation for PyTorch](https://horovod.readthedocs.io/en/stable/pytorch.html), the approach requires us to:</p>
-# MAGIC 
+# MAGIC
 # MAGIC 1. Initialize Horovod
 # MAGIC 2. Align the Horovod processes to specific CPU cores or GPUs
 # MAGIC 3. Scale the learning rate based on the number of Horovod processes
 # MAGIC 4. Wrap the model optimizer for distribution
 # MAGIC 5. Initialize state variables associated with the Horovod processes
-# MAGIC 
+# MAGIC
 # MAGIC Once configured, Horovod will send a separate batch of data to each CPU or GPU enlisted in the training exercise. The scaling of the learning rate is intended to compensate for the fact that each training node is not seeing the full set of the data.  The collective learning is "averaged" with each epoch through the calling of an *allreduce* method at the time of model evaluation: 
 
 # COMMAND ----------
@@ -488,7 +491,7 @@ argmin
 # define function for model evaluation
 def metric_average_hvd(val, name):
   tensor = torch.tensor(val)
-  avg_tensor = hvd.allreduce(tensor, name=name)
+  avg_tensor = hvd.allreduce(tensor, name=name) # name could be avg or sum, etc.
   return avg_tensor.item()
 
 
@@ -502,10 +505,10 @@ def train_and_evaluate_hvd(lr=0.001, momentum=0.0):
   
   # determine devices to use for training
   if torch.cuda.is_available():  # gpu
-    torch.cuda.set_device(hvd.local_rank())
+    torch.cuda.set_device(hvd.local_rank()) # local gpu
     device = torch.cuda.current_device()
   else:
-    device = torch.device("cpu") # cpu
+    device = torch.device("cpu") # cpu # local cpu
   
   # retrieve model and associate with device
   model = get_model()
@@ -513,15 +516,17 @@ def train_and_evaluate_hvd(lr=0.001, momentum=0.0):
   criterion = torch.nn.BCELoss()
   
   # Step 3: Scale the learning rate based on the number of Horovod processes
-  optimizer = torch.optim.SGD(model.classifier[1].parameters(), lr=lr * hvd.size(), momentum=momentum)
+  optimizer = torch.optim.SGD(model.classifier[1].parameters(), lr=lr * hvd.size(), momentum=momentum) # lr thus scaled by number of processes, this is the local optimizer
   
   # Step 4: Wrap the optimizer for distribution
-  optimizer_hvd = hvd.DistributedOptimizer(optimizer, named_parameters=model.named_parameters())
-  exp_lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer_hvd, step_size=7, gamma=0.1)
+  optimizer_hvd = hvd.DistributedOptimizer(optimizer, named_parameters=model.named_parameters()) # distributed version of optimizer_hvd
+  exp_lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer_hvd, step_size=7, gamma=0.1) # local scheduler
   
   # Step 5: Initialize state variables associated with the Horovod processes
   hvd.broadcast_parameters(model.state_dict(), root_rank=0)
   hvd.broadcast_optimizer_state(optimizer, root_rank=0)
+  # Broadcast the initial variable states from rank 0 to all other processes:
+  # This is necessary to ensure consistent initialization of all workers when training is started with random weights or restored from a checkpoint.
   
   # open up access to the petastorm cache
   with converter_train.make_torch_dataloader(
@@ -539,7 +544,7 @@ def train_and_evaluate_hvd(lr=0.001, momentum=0.0):
     
     # each core/gpu will handle a batch
     train_dataloader_iter = iter(train_dataloader)
-    train_steps = len(converter_train) // (BATCH_SIZE * hvd.size())
+    train_steps = len(converter_train) // (BATCH_SIZE * hvd.size()) # reflect the divide by hvd.size() and then by batch_size, the steps per epoch
     test_dataloader_iter = iter(test_dataloader)
     test_steps = max(1, len(converter_test) // (BATCH_SIZE * hvd.size()))
     
@@ -604,7 +609,7 @@ with mlflow.start_run(run_name=config['tuned_model_name']) as run:
 # COMMAND ----------
 
 # MAGIC %md ## Step 5: Drop Petastorm Cache
-# MAGIC 
+# MAGIC
 # MAGIC Now that we're done training the model, we can drop the cached data.  It's important we do this step in order to ensure any subsequent training runs do not see redundant information in the cache folders from prior iterations:
 
 # COMMAND ----------

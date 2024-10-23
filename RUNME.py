@@ -37,7 +37,9 @@ job_json = {
         "max_concurrent_runs": 1,
         "tags": {
             "usage": "solacc_testing",
-            "group": "RCG"
+            "group": "RCG",
+            "do_not_delete": True,
+            "removeAfter": "2025-01-01",
         },
         "tasks": [
             
